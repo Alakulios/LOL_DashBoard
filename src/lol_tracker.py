@@ -2,24 +2,21 @@ import pandas as pd
 import requests
 import time
 import gspread
-import os
 from datetime import datetime, timezone
 from google.oauth2.service_account import Credentials
 from config import (
-    API_KEY, ROUTING, MATCH_COUNT_PER_REQUEST,
+    API_KEY, CREDS_PATH, ROUTING, MATCH_COUNT_PER_REQUEST,
     START_TIMESTAMP, CURRENT_TIMESTAMP,
     SUMMONERS, CHAMPION_LISTS, queue_types
 )
 
 # === GOOGLE SHEETS SETUP ===
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-base_dir = os.path.dirname(os.path.abspath(__file__))
-creds_path = os.path.join(base_dir, "..", "credentials", "service_account.json")
 
 try:
-    creds = Credentials.from_service_account_file(creds_path, scopes=scope)
+    creds = Credentials.from_service_account_file(CREDS_PATH, scopes=scope)
 except FileNotFoundError:
-    print(f"Error: {creds_path} not found. Please place service_account.json in credentials/")
+    print(f"Error: {CREDS_PATH} not found. Please ensure the path in credentials/.env is correct.")
     exit(1)
 
 client = gspread.authorize(creds)
@@ -183,11 +180,24 @@ def generate_champion_report():
 
     matches = pd.DataFrame(worksheet.get_all_records())
     display_to_key = {
-        "Aurelion Sol": "AurelionSol", "Cho'Gath": "Chogath", "Dr. Mundo": "DrMundo",
-        "Jarvan IV": "JarvanIV", "Kai'Sa": "Kaisa", "Kha'Zix": "Khazix", "Kog'Maw": "KogMaw",
-        "K'Sante": "KSante", "Lee Sin": "LeeSin", "Master Yi": "MasterYi", "Miss Fortune": "MissFortune",
-        "MonkeyKing": "Wukong", "Nunu & Willump": "Nunu", "Rek'Sai": "RekSai", "Tahm Kench": "TahmKench",
-        "Twisted Fate": "TwistedFate", "Vel'Koz": "Velkoz", "Xin Zhao": "XinZhao"
+        "Aurelion Sol": "AurelionSol",
+        "Cho'Gath": "Chogath",
+        "Dr. Mundo": "DrMundo",
+        "Jarvan IV": "JarvanIV",
+        "Kai'Sa": "Kaisa",
+        "Kha'Zix": "Khazix",
+        "Kog'Maw": "KogMaw",
+        "K'Sante": "KSante",
+        "Lee Sin": "LeeSin",
+        "Master Yi": "MasterYi",
+        "Miss Fortune": "MissFortune",
+        "MonkeyKing": "Wukong",
+        "Nunu & Willump": "Nunu",
+        "Rek'Sai": "RekSai",
+        "Tahm Kench": "TahmKench",
+        "Twisted Fate": "TwistedFate",
+        "Vel'Koz": "Velkoz",
+        "Xin Zhao": "XinZhao"
     }
     if not matches.empty:
         matches['champion'] = matches['champion'].map(display_to_key).fillna(matches['champion'])
@@ -219,8 +229,8 @@ def generate_champion_report():
         learning_req = config.get("learning_games_required", 2)
         for week in requirements[requirements['SummonerName'] == summoner_name]['Week_Start'].unique():
             champ_rows = games_played[
-                (games_played['Week_Start'] == week) & 
-                (games_played['summonerName'] == summoner_name) & 
+                (games_played['Week_Start'] == week) &
+                (games_played['summonerName'] == summoner_name) &
                 (games_played['champion'].isin(core_champs))
             ]
             total_learning_games = champ_rows['Games_Played'].sum()
@@ -243,7 +253,7 @@ def generate_champion_report():
         if total_req > 0 and champs_to_count:
             for week in requirements[requirements['SummonerName'] == summoner_name]['Week_Start'].unique():
                 week_matches = matches[
-                    (matches['Week_Start'] == week) & 
+                    (matches['Week_Start'] == week) &
                     (matches['summonerName'] == summoner_name) &
                     (matches['champion'].isin(champs_to_count))
                 ]
@@ -299,6 +309,6 @@ def generate_champion_report():
 
 # === MAIN EXECUTION ===
 if __name__ == "__main__":
-    update_match_data(worksheet) 
+    update_match_data(worksheet)
     generate_champion_report()
     write_current_week()

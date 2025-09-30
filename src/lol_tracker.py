@@ -98,7 +98,7 @@ def get_match_ids(puuid, summoner_name, tag_line):
             print(f"Added {len(matches)} match IDs for PUUID {puuid}. Total: {len(match_list)}")
             start += MATCH_COUNT_PER_REQUEST
         elif r.status_code == 429:
-            print("Rate limit exceeded in match IDs zapew: Waiting 10 seconds...")
+            print("Rate limit exceeded in match IDs request. Waiting 10 seconds...")
             time.sleep(10)
             continue
         else:
@@ -230,6 +230,14 @@ def generate_champion_report():
             requirements = pd.DataFrame(req_sheet.get_all_records())
             if not requirements.empty:
                 print(f"Weekly_Requirements columns: {requirements.columns.tolist()}")
+                # Remove duplicates from requirements
+                requirements = requirements.drop_duplicates(subset=['Week_Start', 'SummonerName', 'Champion'], keep='first')
+                print(f"Removed {len(req_sheet.get_all_records()) - len(requirements)} duplicates from Weekly_Requirements")
+                # Update sheet with deduplicated data
+                req_sheet.clear()
+                req_sheet.append_row(headers)
+                if not requirements.empty:
+                    req_sheet.append_rows(requirements.values.tolist())
     
     except gspread.exceptions.WorksheetNotFound:
         print("Creating Weekly_Requirements sheet.")
@@ -295,13 +303,13 @@ def generate_champion_report():
                 summoner_name = full_id.split('#')[0]
                 config = CHAMPION_LISTS.get(full_id, {})
                 learning_req = config.get("learning_games_required", 2)
-                if not ((requirements['Week_Start'] == week) &
+                if not ((requirements['Week_Start'] == week.strftime('%Y-%m-%d')) &
                         (requirements['SummonerName'] == summoner_name) &
                         (requirements['Champion'] == 'Learning')).any():
                     new_rows.append([week.strftime('%Y-%m-%d'), summoner_name, 'Learning', learning_req])
                 total_req = config.get("total_games_required", 0)
                 if total_req > 0:
-                    if not ((requirements['Week_Start'] == week) &
+                    if not ((requirements['Week_Start'] == week.strftime('%Y-%m-%d')) &
                             (requirements['SummonerName'] == summoner_name) &
                             (requirements['Champion'] == 'Total Games')).any():
                         new_rows.append([week.strftime('%Y-%m-%d'), summoner_name, 'Total Games', total_req])
@@ -329,9 +337,11 @@ def generate_champion_report():
             requirements_data = req_sheet.get_all_values()
             if requirements_data and requirements_data[0] == headers:
                 requirements = pd.DataFrame(req_sheet.get_all_records())
+                # Remove duplicates after reload
+                requirements = requirements.drop_duplicates(subset=['Week_Start', 'SummonerName', 'Champion'], keep='first')
+                print(f"Reloaded Weekly_Requirements with {len(requirements)} unique rows")
             else:
                 requirements = pd.DataFrame(new_rows, columns=headers)
-            print(f"Reloaded Weekly_Requirements columns: {requirements.columns.tolist()}")
 
     # Convert Week_Start to datetime, if it exists
     if not requirements.empty and 'Week_Start' in requirements.columns:
@@ -340,7 +350,7 @@ def generate_champion_report():
         requirements['Required_Games'] = requirements['Required_Games'].astype(int, errors='ignore')
     else:
         print("No valid requirements data after reload. Proceeding with empty requirements.")
-        requirements = pd.DataFrame(columns=['Week_Start', 'SummonerName', 'Champion', 'Required_Games'])
+        requirements = pd.DataFrame(columns=headers)
 
     learning_rows = []
     for full_id in SUMMONERS:
@@ -393,12 +403,17 @@ def generate_champion_report():
                     'Met_Requirement': 'Yes' if total_games >= total_req else 'No'
                 })
 
-    report = pd.concat([pd.DataFrame(learning_rows), pd.DataFrame(total_rows)], ignore_index=True)
+    # Deduplicate learning_rows and total_rows
+    learning_df = pd.DataFrame(learning_rows).drop_duplicates(subset=['Week_Start', 'summonerName', 'champion'])
+    total_df = pd.DataFrame(total_rows).drop_duplicates(subset=['Week_Start', 'summonerName', 'champion'])
+    report = pd.concat([learning_df, total_df], ignore_index=True)
+    
     if not report.empty:
         report['Week_Start'] = pd.to_datetime(report['Week_Start'], utc=True)
     else:
         report = pd.DataFrame(columns=['Week_Start', 'summonerName', 'champion', 'Games_Played', 'Required_Games', 'Difference', 'Met_Requirement'])
 
+    # Merge with requirements
     report = pd.merge(
         requirements,
         report,
@@ -418,6 +433,8 @@ def generate_champion_report():
     report['Difference'] = report['Games_Played'] - report['Required_Games']
     report['Met_Requirement'] = report.apply(lambda x: 'Yes' if x['Games_Played'] >= x['Required_Games'] else 'No', axis=1)
 
+    # Deduplicate final report
+    report = report.drop_duplicates(subset=['Week_Start', 'summonerName', 'champion'], keep='first')
     report = report.sort_values(['Met_Requirement', 'summonerName', 'Week_Start', 'champion'])
     report['Week_Start'] = report['Week_Start'].dt.strftime('%Y-%m-%d')
 
@@ -429,8 +446,18 @@ def generate_champion_report():
     report_sheet = sheet.add_worksheet(title="Champion_Tracker", rows=max(100, len(report)+1), cols=7)
     headers = ["Week_Start", "summonerName", "champion", "Games_Played", "Required_Games", "Difference", "Met_Requirement"]
     report_sheet.append_row(headers)
-    report_sheet.append_rows(report[headers].values.tolist())
-    print("Updated Champion tracking report generated in 'Champion_Tracker' sheet.")
+    for attempt in range(max_retries):
+        try:
+            report_sheet.append_rows(report[headers].values.tolist())
+            print("Updated Champion tracking report generated in 'Champion_Tracker' sheet.")
+            break
+        except gspread.exceptions.APIError as e:
+            if attempt < max_retries - 1:
+                print(f"APIError writing to Champion_Tracker: {e}. Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print(f"Failed to write to Champion_Tracker after {max_retries} attempts: {e}")
+                raise
 
 # === MAIN EXECUTION ===
 if __name__ == "__main__":

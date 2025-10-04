@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 import os
 
 # Load environment variables from .env file in src folder
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), "credentials", ".env"))
 
 # Sensitive variables loaded from .env
 API_KEY = os.getenv("RIOT_API_KEY")
@@ -13,7 +13,7 @@ MATCH_COUNT_PER_REQUEST = 100
 START_TIMESTAMP = 1756702800000  # Sep 1, 2025, in milliseconds
 CURRENT_TIMESTAMP = int(datetime.now(timezone.utc).timestamp() * 1000)
 SUMMONERS = ["TreywayHella#TWAY", "Ping is Skill#NA1", "Simpleist#Mewin", "TEAGUZZLER19#9810", "DFG#1v9", "Tuzlo#NA1", "Kanto#milk"]
-CHAMPION_LISTS = {
+CHAMPION_LISTS = {  # Contains core champions and total champions for each summoner
     "TreywayHella#TWAY": {
         "core_champions": ["LeeSin"],
         "learning_games_required": 2,
@@ -57,7 +57,7 @@ CHAMPION_LISTS = {
         "total_champions": ["Rakan", "Janna", "Bard", "Nautilus", "Neeko"]
     }
 }
-queue_types = {
+queue_types = {  # Takes queue ID and returns queue name
     0: "Custom Game",
     400: "Normal Draft",
     420: "Ranked Solo",

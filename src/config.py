@@ -82,3 +82,25 @@ if not API_KEY:
     raise ValueError("RIOT_API_KEY not found in src/.env file")
 if not CREDS_PATH:
     raise ValueError("GOOGLE_CREDS_PATH not found in src/.env file")
+
+# If CREDS_PATH is a relative path, try to resolve it in a couple of sensible places
+if CREDS_PATH and not os.path.isabs(CREDS_PATH):
+    # repo root is one directory above this file's directory
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    # First candidate: relative to repo root (common when env paths are repo-root relative)
+    candidate_repo = os.path.normpath(os.path.join(repo_root, CREDS_PATH))
+    # Second candidate: relative to the src directory (in case the .env was written assuming src as CWD)
+    src_dir = os.path.dirname(__file__)
+    candidate_src = os.path.normpath(os.path.join(src_dir, CREDS_PATH))
+
+    if os.path.exists(candidate_repo):
+        CREDS_PATH = candidate_repo
+    elif os.path.exists(candidate_src):
+        CREDS_PATH = candidate_src
+    else:
+        # Prefer the repo-root candidate in the final error message (more explicit), but do not silently pick a wrong location
+        CREDS_PATH = candidate_repo
+
+# Provide a clearer error if the file still does not exist
+if CREDS_PATH and not os.path.exists(CREDS_PATH):
+    raise FileNotFoundError(f"Google credentials file not found at: {CREDS_PATH}\nTried: {candidate_repo} and {candidate_src}")

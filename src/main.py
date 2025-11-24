@@ -28,7 +28,7 @@ def nuke_pycache() -> None:
 # Main execution
 if __name__ == "__main__":
     nuke_pycache()
-    #
+    #Import all necessary functions
     from sheets import update_match_data, write_current_week, generate_champion_report, generate_weekly_summary 
     from riot_api import get_summoner_puuid, get_match_ids, get_match_data
 

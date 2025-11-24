@@ -96,33 +96,34 @@ def get_match_data(match_id: str, puuid: str) -> Dict[str, Any]:
     patch = ".".join(version.split(".")[:2]) if "." in version else version
 
     return {
-        "match_id": match_id,
-        "summonername": name.lower(),
-        "champion": p["championName"],
-        "win": p["win"],
-        "kills": p["kills"],
-        "deaths": p["deaths"],
-        "assists": p["assists"],
-        "gameduration_min": int(data["gameDuration"] / 60),
-        "gamecreation": datetime.fromtimestamp(data["gameCreation"]/1000, tz=timezone.utc).isoformat(),
-        "gametype": queue_types.get(data.get("queueId", 0), "Unknown"),
-        "role": p.get("role"),
-        "lane": p.get("lane"),
-        "teamPosition": p.get("teamPosition") or p.get("individualPosition"),
-        
-        "killsParticipation": round((p["kills"] + p["assists"]) / max(team_kills, 1), 3),
-        "damagePerMinute": round(p["totalDamageDealtToChampions"] / game_minutes, 1),
-        "visionScore": p.get("visionScore", 0),
-        "visionScorePerMinute": round(p.get("visionScore", 0) / game_minutes, 2),
-        
-        "goldEarned": p["goldEarned"],
-        "totalCs": p["totalMinionsKilled"] + p.get("neutralMinionsKilled", 0),
-        "cspm": round((p["totalMinionsKilled"] + p.get("neutralMinionsKilled", 0)) / game_minutes, 1),
-        
-        "firstBloodKill": p.get("firstBloodKill", False),
-        "firstBloodAssist": p.get("firstBloodAssist", False),
-        
-        "gameMode": data.get("gameMode"),
-        "queueId": data.get("queueId"),
-        "patch": patch,
-    }
+    "match_id": match_id,
+    "summonername": name.lower(),
+    "champion": p["championName"],
+    "win": p["win"],
+    "kills": p["kills"],
+    "deaths": p["deaths"],
+    "assists": p["assists"],
+    "gameduration_min": int(data["gameDuration"] / 60),
+    "gamecreation": datetime.fromtimestamp(data["gameCreation"]/1000, tz=timezone.utc).isoformat(),
+    "gametype": queue_types.get(data.get("queueId", 0), "Unknown"),
+    "role": p.get("role"),
+    "lane": p.get("lane"),
+    "teamPosition": p.get("teamPosition") or p.get("individualPosition"),
+
+    # THESE ARE THE EXACT COLUMN NAMES — MUST MATCH DB
+    "kda": round((p["kills"] + p["assists"]) / max(p["deaths"], 1), 2),
+    "kill_participation": round((p["kills"] + p["assists"]) / max(team_kills, 1), 3),
+    "dpm": round(p["totalDamageDealtToChampions"] / game_minutes, 1),
+    "vspm": round(p.get("visionScore", 0) / game_minutes, 2),
+    "cspm": round((p["totalMinionsKilled"] + p.get("neutralMinionsKilled", 0)) / game_minutes, 1),
+
+    # Optional: keep raw fields if you want
+    "visionScore": p.get("visionScore", 0),
+    "goldEarned": p["goldEarned"],
+    "totalCs": p["totalMinionsKilled"] + p.get("neutralMinionsKilled", 0),
+    "firstBloodKill": p.get("firstBloodKill", False),
+    "firstBloodAssist": p.get("firstBloodAssist", False),
+    "gameMode": data.get("gameMode"),
+    "queueId": data.get("queueId"),
+    "patch": patch,
+}

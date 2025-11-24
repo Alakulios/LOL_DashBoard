@@ -1,98 +1,128 @@
+# src/riot_api.py
+from typing import Dict, Any, List
 import requests
 import time
+from datetime import datetime, timezone
 import pandas as pd
-from config import API_KEY, ROUTING, MATCH_COUNT_PER_REQUEST, START_TIMESTAMP, CURRENT_TIMESTAMP, queue_types
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from config import API_KEY, ROUTING, queue_types
 
-def get_summoner_puuid(full_id):
-    """Gets PUUID for a summoner using their Riot ID."""
-    summoner_name, tag_line = full_id.split('#')
-    summoner_url = f"https://{ROUTING}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{summoner_name}/{tag_line}"
-    headers = {"X-Riot-Token": API_KEY}
-    r = requests.get(summoner_url, headers=headers)
-    if r.status_code == 200:
-        return r.json().get("puuid")
-    elif r.status_code == 429:
-        print(f"Rate limit exceeded for {full_id}. Waiting 10 seconds...")
-        time.sleep(10)
-        return get_summoner_puuid(full_id)
-    else:
-        print(f"Error getting PUUID for {full_id}: {r.status_code} - {r.text}")
-        return None
+BASE_URL = f"https://{ROUTING}.api.riotgames.com"
 
-def get_match_ids(puuid, summoner_name, tag_line, last_fetched_match):
-    """Retrieves match IDs for a PUUID, filtering for those on or after START_TIMESTAMP."""
-    match_list = []
-    start = 0
-    
-    while True:
-        url = (
-            f"https://{ROUTING}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?"
-            f"startTime={int(START_TIMESTAMP / 1000)}&endTime={int(CURRENT_TIMESTAMP / 1000)}&"
-            f"count={MATCH_COUNT_PER_REQUEST}&start={start}"
-        )
-        headers = {"X-Riot-Token": API_KEY}
-        r = requests.get(url, headers=headers)
-        if r.status_code == 200:
-            matches = r.json()
-            if not matches:
-                print(f"No more matches for PUUID {puuid} at start={start}")
-                break
-            # Stop if we encounter the last fetched match ID
-            if last_fetched_match and last_fetched_match in matches:
-                match_list.extend([m for m in matches[:matches.index(last_fetched_match)] if m != last_fetched_match])
-                print(f"Stopped at last fetched match {last_fetched_match} for {summoner_name}#{tag_line}")
-                break
-            match_list.extend(matches)
-            print(f"Added {len(matches)} match IDs for PUUID {puuid}. Total: {len(match_list)}")
-            start += MATCH_COUNT_PER_REQUEST
-        elif r.status_code == 429:
-            print("Rate limit exceeded in match IDs request. Waiting 10 seconds...")
+# --- GLOBAL SESSION WITH RETRY ---
+session = requests.Session()
+retry = Retry(
+    total=10,
+    backoff_factor=2,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50))
+
+# --- RATE LIMIT TRACKING ---
+_last_call = 0.0
+SHORT_RATE = 1.0 / 20
+_call_history: List[float] = []
+
+def _rate_limit():
+    global _last_call, _call_history
+    now = time.time()
+
+    # Riot API Calls 20 per second
+    elapsed = now - _last_call
+    if elapsed < SHORT_RATE:
+        time.sleep(SHORT_RATE - elapsed)
+    _last_call = time.time()
+
+    # Riot API Calls 100 per 2 minutes
+    _call_history = [t for t in _call_history if now - t < 120]
+    if len(_call_history) >= 100:
+        wait = 120 - (now - _call_history[0])
+        if wait > 0:
+            print(f"[LIMIT] Sleeping {wait:.1f}s (100/2min)")
+            time.sleep(wait)
+    _call_history.append(time.time())
+
+def _get(url: str, params=None):
+    for attempt in range(20):  # 20 retries
+        _rate_limit()
+        try:
+            # Fresh session per call to avoid SSL EOF
+            with requests.Session() as sess:
+                adapter = HTTPAdapter(
+                    max_retries=Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+                )
+                sess.mount("https://", adapter)
+                resp = sess.get(
+                    url,
+                    params=params,
+                    headers={"X-Riot-Token": API_KEY},
+                    timeout=30
+                )
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", 120))
+                print(f"[429] Waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.SSLError as e:
+            print(f"[SSL ERROR] {e} — retry {attempt + 1}/20")
+            time.sleep(5)
+        except Exception as e:
+            print(f"[ERROR] {e} — retry {attempt + 1}/20")
             time.sleep(10)
-            continue
-        else:
-            print(f"Error getting match IDs for PUUID {puuid}: {r.status_code} - {r.text}")
-            break
-        time.sleep(1.2)  # Avoid rate limits
-    
-    return match_list
+    raise Exception("Max retries exceeded")
 
-def get_match_data(match_id, summoner_name, tag_line):
-    """Fetches match data and extracts relevant stats for a summoner."""
-    url = f"https://{ROUTING}.api.riotgames.com/lol/match/v5/matches/{match_id}"
-    headers = {"X-Riot-Token": API_KEY}
-    r = requests.get(url, headers=headers)
-    if r.status_code != 200:
-        if r.status_code == 429:
-            print(f"Rate limit exceeded for match {match_id}. Waiting 10 seconds...")
-            time.sleep(10)
-            return None, True
-        print(f"Error getting match {match_id}: {r.status_code} - {r.text}")
-        return None, False
-    data = r.json()
-    game_creation = int(data["info"]["gameCreation"])
-    game_date = pd.to_datetime(game_creation, unit="ms", utc=True).isoformat()
-    if game_creation < START_TIMESTAMP or game_creation > CURRENT_TIMESTAMP:
-        print(f"Match {match_id} is outside September 2025 (gameCreation: {game_creation}ms, date: {game_date}). Skipping.")
-        return None, True
-    queue_id = data["info"]["queueId"]
-    game_type = queue_types.get(queue_id, "Unknown")
-    if game_type == "Unknown":
-        print(f"Unknown queueId {queue_id} for match {match_id}")
-        return None, True
-    for p in data["info"]["participants"]:
-        if p["riotIdGameName"] == summoner_name and p["riotIdTagline"] == tag_line:
-            return [
-                match_id,
-                summoner_name,
-                tag_line,
-                p["championName"],
-                p["win"],
-                p["kills"],
-                p["deaths"],
-                p["assists"],
-                round(data["info"]["gameDuration"] / 60, 2),
-                game_date,
-                game_type
-            ], True
-    print(f"No participant data for {summoner_name}#{tag_line} in match {match_id}. Skipping.")
-    return None, True
+def get_summoner_puuid(name: str, tag: str) -> str:
+    return _get(f"{BASE_URL}/riot/account/v1/accounts/by-riot-id/{name}/{tag}")["puuid"]
+
+def get_match_ids(puuid: str, start_time: int = 0) -> List[str]:
+    params = {"startTime": start_time // 1000, "count": 100}  # MAX 100
+    return _get(f"{BASE_URL}/lol/match/v5/matches/by-puuid/{puuid}/ids", params)
+
+def get_match_data(match_id: str, puuid: str) -> Dict[str, Any]:
+    data = _get(f"{BASE_URL}/lol/match/v5/matches/{match_id}")["info"]
+    p = next(x for x in data["participants"] if x["puuid"] == puuid)
+    name = p.get("riotIdGameName") or p.get("summonerName") or "UNKNOWN"
+    
+    # Calculate team total kills once
+    team_kills = sum(part["kills"] for part in data["participants"])
+    game_minutes = data["gameDuration"] / 60.0
+
+    # Extract patch (e.g., "14.23")
+    version = data.get("gameVersion", "0.0")
+    patch = ".".join(version.split(".")[:2]) if "." in version else version
+
+    return {
+        "match_id": match_id,
+        "summonername": name.lower(),
+        "champion": p["championName"],
+        "win": p["win"],
+        "kills": p["kills"],
+        "deaths": p["deaths"],
+        "assists": p["assists"],
+        "gameduration_min": int(data["gameDuration"] / 60),
+        "gamecreation": datetime.fromtimestamp(data["gameCreation"]/1000, tz=timezone.utc).isoformat(),
+        "gametype": queue_types.get(data.get("queueId", 0), "Unknown"),
+        "role": p.get("role"),
+        "lane": p.get("lane"),
+        "teamPosition": p.get("teamPosition") or p.get("individualPosition"),
+        
+        "killsParticipation": round((p["kills"] + p["assists"]) / max(team_kills, 1), 3),
+        "damagePerMinute": round(p["totalDamageDealtToChampions"] / game_minutes, 1),
+        "visionScore": p.get("visionScore", 0),
+        "visionScorePerMinute": round(p.get("visionScore", 0) / game_minutes, 2),
+        
+        "goldEarned": p["goldEarned"],
+        "totalCs": p["totalMinionsKilled"] + p.get("neutralMinionsKilled", 0),
+        "cspm": round((p["totalMinionsKilled"] + p.get("neutralMinionsKilled", 0)) / game_minutes, 1),
+        
+        "firstBloodKill": p.get("firstBloodKill", False),
+        "firstBloodAssist": p.get("firstBloodAssist", False),
+        
+        "gameMode": data.get("gameMode"),
+        "queueId": data.get("queueId"),
+        "patch": patch,
+    }

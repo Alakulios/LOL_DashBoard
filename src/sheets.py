@@ -1,344 +1,271 @@
+# src/sheets.py
+"""
+FINAL VERSION —
+- Removes Riot's duplicate/fake match IDs 
+"""
+
+from __future__ import annotations
+
 import pandas as pd
-import gspread
 import time
-from google.oauth2.service_account import Credentials
-from config import CREDS_PATH, SUMMONERS, CHAMPION_LISTS
 from datetime import datetime, timezone
+from typing import List, Dict, Any, Callable, Optional
+import pytz
 
-def initialize_sheets():
-    """Initialize Google Sheets client and worksheets."""
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    try:
-        creds = Credentials.from_service_account_file(CREDS_PATH, scopes=scope)
-    except FileNotFoundError:
-        print(f"Error: {CREDS_PATH} not found. Please ensure the path in credentials/.env is correct.")
-        exit(1)
-    client = gspread.authorize(creds)
-    sheet = client.open("LOL_Tracker")
-    worksheet = sheet.worksheet("Matches")
-    
-    try:
-        last_fetched_sheet = sheet.worksheet("Last_Fetched_Match")
-    except gspread.exceptions.WorksheetNotFound:
-        last_fetched_sheet = sheet.add_worksheet(title="Last_Fetched_Match", rows=100, cols=3)
-        last_fetched_sheet.append_row(["SummonerName", "TagLine", "LastMatchID"])
-    
-    return sheet, worksheet, last_fetched_sheet
+from supabase import create_client, Client
 
-def get_last_fetched_match(summoner_name, tag_line, last_fetched_sheet):
-    """Retrieve the last fetched match ID for a summoner."""
-    try:
-        last_fetched_data = last_fetched_sheet.get_all_values()
-        for row in last_fetched_data[1:]:  # Skip header
-            if len(row) >= 3 and row[0] == summoner_name and row[1] == tag_line:
-                return row[2]
-    except Exception as e:
-        print(f"Error reading last fetched match for {summoner_name}#{tag_line}: {e}")
-    return None
+# ----------------------------------------------------------------------
+# Central Time helper
+# ----------------------------------------------------------------------
+central_tz = pytz.timezone("US/Central")
+def ms_to_central(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(central_tz)
 
-def update_last_fetched_match(summoner_name, tag_line, match_id, last_fetched_sheet):
-    """Update the last fetched match ID for a summoner."""
-    try:
-        last_fetched_data = last_fetched_sheet.get_all_values()
-        for i, row in enumerate(last_fetched_data[1:], start=2):  # Skip header
-            if len(row) >= 3 and row[0] == summoner_name and row[1] == tag_line:
-                last_fetched_sheet.update_cell(i, 3, match_id)
-                return
-        # If summoner not found, append new row
-        last_fetched_sheet.append_row([summoner_name, tag_line, match_id])
-    except Exception as e:
-        print(f"Error updating last fetched match for {summoner_name}#{tag_line}: {e}")
+# ----------------------------------------------------------------------
+# Config import
+# ----------------------------------------------------------------------
+from config import (
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    SUMMONERS,
+    CHAMPION_LISTS,
+    get_current_monday,
+    START_TIMESTAMP,
+)
 
-def update_match_data(sheet, worksheet, last_fetched_sheet, get_summoner_puuid, get_match_ids, get_match_data):
-    """Update Google Sheet with match data for all summoners."""
-    headers = ["match_id", "summonerName", "tagLine", "champion", "win", "kills", "deaths", "assists", "gameDuration_min", "gameCreation", "gameType"]
-    try:
-        existing_data = worksheet.get_all_values()
-        if not existing_data or existing_data[0] != headers:
-            worksheet.clear()
-            worksheet.append_row(headers)
-            existing_matches = set()
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ----------------------------------------------------------------------
+# Current week helper
+# ----------------------------------------------------------------------
+def _ensure_current_week() -> str:
+    today_monday = get_current_monday()
+    res = supabase.table("current_week").select("week_start").execute()
+
+    if not res.data:
+        supabase.table("current_week").insert({"id": 1, "week_start": str(today_monday)}).execute()
+        print(f"[INIT] current_week → {today_monday}")
+        return str(today_monday)
+
+    db_week = res.data[0]["week_start"]
+    if db_week != str(today_monday):
+        supabase.table("current_week").update({"week_start": str(today_monday)}).eq("id", 1).execute()
+        print(f"[ADVANCE] week {db_week} → {today_monday}")
+    return str(today_monday)
+
+
+# ----------------------------------------------------------------------
+# 1. FETCH & UPSERT MATCHES 
+# ----------------------------------------------------------------------
+def update_match_data(
+    get_puuid: Callable[[str, str], str],
+    get_ids: Callable[[str, Optional[int]], List[str]],
+    get_data: Callable[[str, str], Dict[str, Any]],
+) -> None:
+    total_new = 0
+
+    for s in SUMMONERS:
+        name = s["summonerName"]
+        tag = s["tagLine"]
+        puuid = get_puuid(name, tag)
+
+        # Resume logic
+        resume = supabase.table("last_fetched_match").select("lastMatchID").eq("summonerName", name).execute()
+        start_time = START_TIMESTAMP
+        if resume.data and resume.data[0]["lastMatchID"]:
+            last_id = resume.data[0]["lastMatchID"]
+            check = supabase.table("matches").select("gamecreation").eq("match_id", last_id).execute()
+            if check.data:
+                start_time = int(pd.Timestamp(check.data[0]["gamecreation"]).timestamp() * 1000) + 1
+                print(f"[RESUME] {name} → after {ms_to_central(start_time):%Y-%m-%d %I:%M %p %Z}")
+            else:
+                print(f"[RESUME] Last match not found → starting from config")
         else:
-            existing_matches = set((row[0], row[1], row[2]) for row in existing_data[1:] if row and len(row) >= 3)
-    except gspread.exceptions.WorksheetNotFound:
-        print("Matches worksheet not found, creating new one")
-        worksheet = sheet.add_worksheet(title="Matches", rows=100, cols=len(headers))
-        worksheet.append_row(headers)
-        existing_matches = set()
+            print(f"[START] {name} → from {ms_to_central(START_TIMESTAMP):%Y-%m-%d %I:%M %p %Z}")
 
-    for full_id in SUMMONERS:
-        summoner_name, tag_line = full_id.split('#')
-        puuid = get_summoner_puuid(full_id)
-        if not puuid:
-            print(f"Skipping {full_id}: No PUUID found.")
-            continue
-        last_fetched_match = get_last_fetched_match(summoner_name, tag_line, last_fetched_sheet)
-        match_ids = get_match_ids(puuid, summoner_name, tag_line, last_fetched_match)
-        print(f"Found {len(match_ids)} total match IDs for {full_id}")
-        if match_ids:
-            update_last_fetched_match(summoner_name, tag_line, match_ids[0], last_fetched_sheet)
-        for mid in match_ids:
-            if (mid, summoner_name, tag_line) in existing_matches:
-                print(f"Match {mid} for {summoner_name}#{tag_line} already exists in sheet. Skipping.")
-                continue
-            match_data, should_continue = get_match_data(mid, summoner_name, tag_line)
-            if match_data:
-                print(f"Appending match data: {match_data}")
-                worksheet.append_row(match_data)
-                existing_matches.add((mid, summoner_name, tag_line))
-                print(f"Successfully appended match {mid} for {summoner_name}#{tag_line}.")
-            if not should_continue:
+        all_ids: List[str] = []
+        current = start_time
+
+        while True:
+            print(f"\n[BATCH] startTime = {current}")
+            batch = get_ids(puuid, current)
+            print(f"[BATCH] Got {len(batch)} match IDs")
+
+            if not batch:
+                print("[DONE] No more matches")
                 break
-            time.sleep(1.2)  # Avoid rate limits
 
-def write_current_week(sheet):
-    """Writes the current week's Monday start date to a new sheet named Current_Week."""
-    try:
-        current_date = pd.to_datetime(datetime.now(timezone.utc))
-        current_monday = current_date - pd.Timedelta(days=(current_date.weekday() % 7))
-        current_week_str = current_monday.strftime('%Y-%m-%d')
-        
-        try:
-            current_week_sheet = sheet.worksheet("Current_Week")
-            sheet.del_worksheet(current_week_sheet)
-        except gspread.exceptions.WorksheetNotFound:
-            pass
-        current_week_sheet = sheet.add_worksheet(title="Current_Week", rows=2, cols=2)
-        
-        current_week_sheet.append_row(["Current Week Start", current_week_str])
-        print(f"Written current week start ({current_week_str}) to 'Current_Week' sheet.")
-        
-    except Exception as e:
-        print(f"Error writing current week to sheet: {e}")
+            all_ids.extend(batch)
 
-def generate_champion_report(sheet, worksheet):
-    """Generates a report comparing games played to weekly requirements."""
-    max_retries = 3
-    retry_delay = 5  # Seconds to wait between retries
-    display_to_key = {
-        "Aurelion Sol": "AurelionSol",
-        "Cho'Gath": "Chogath",
-        "Dr. Mundo": "DrMundo",
-        "Jarvan IV": "JarvanIV",
-        "Kai'Sa": "Kaisa",
-        "Kha'Zix": "Khazix",
-        "Kog'Maw": "KogMaw",
-        "K'Sante": "KSante",
-        "Lee Sin": "LeeSin",
-        "Master Yi": "MasterYi",
-        "Miss Fortune": "MissFortune",
-        "MonkeyKing": "Wukong",
-        "Nunu & Willump": "Nunu",
-        "Rek'Sai": "RekSai",
-        "Tahm Kench": "TahmKench",
-        "Twisted Fate": "TwistedFate",
-        "Vel'Koz": "Velkoz",
-        "Xin Zhao": "XinZhao"
-    }
-
-    try:
-        req_sheet = sheet.worksheet("Weekly_Requirements")
-        requirements_data = req_sheet.get_all_values()
-        headers = ['Week_Start', 'SummonerName', 'Champion', 'Required_Games']
-        
-        if not requirements_data or requirements_data[0] != headers:
-            print("Initializing Weekly_Requirements sheet with correct headers.")
-            req_sheet.clear()
-            req_sheet.append_row(headers)
-            requirements = pd.DataFrame(columns=headers)
-        else:
-            requirements = pd.DataFrame(req_sheet.get_all_records())
-            if not requirements.empty:
-                print(f"Weekly_Requirements columns: {requirements.columns.tolist()}")
-                requirements = requirements.drop_duplicates(subset=['Week_Start', 'SummonerName', 'Champion'], keep='first')
-                print(f"Removed {len(req_sheet.get_all_records()) - len(requirements)} duplicates from Weekly_Requirements")
-                req_sheet.clear()
-                req_sheet.append_row(headers)
-                if not requirements.empty:
-                    req_sheet.append_rows(requirements.values.tolist())
-    
-    except gspread.exceptions.WorksheetNotFound:
-        print("Creating Weekly_Requirements sheet.")
-        req_sheet = sheet.add_worksheet(title="Weekly_Requirements", rows=100, cols=4)
-        headers = ['Week_Start', 'SummonerName', 'Champion', 'Required_Games']
-        req_sheet.append_row(headers)
-        requirements = pd.DataFrame(columns=headers)
-
-    if 'Week_Start' not in requirements.columns:
-        print("Warning: 'Week_Start' column not found in Weekly_Requirements sheet. Initializing empty requirements.")
-        requirements = pd.DataFrame(columns=headers)
-
-    matches = pd.DataFrame(worksheet.get_all_records())
-    if not matches.empty:
-        matches['champion'] = matches['champion'].map(display_to_key).fillna(matches['champion'])
-        matches['gameCreation'] = pd.to_datetime(matches['gameCreation'], errors='coerce', utc=True)
-        matches = matches.dropna(subset=['gameCreation'])
-        sept_start = pd.to_datetime('2025-09-01', utc=True)
-        matches = matches[matches['gameCreation'] >= sept_start]
-        matches['Week_Start'] = matches['gameCreation'].apply(
-            lambda x: (x - pd.Timedelta(days=x.weekday())).normalize()
-        )
-        games_played = matches.groupby(['Week_Start', 'summonerName', 'champion']).size().reset_index(name='Games_Played')
-        games_played['Week_Start'] = pd.to_datetime(games_played['Week_Start'], utc=True)
-    else:
-        print("No matches data. Skipping report.")
-        games_played = pd.DataFrame(columns=['Week_Start', 'summonerName', 'champion', 'Games_Played'])
-
-    min_week = matches['Week_Start'].min() if not matches.empty else pd.to_datetime('2025-09-01', utc=True)
-    current_date = pd.to_datetime(datetime.now(timezone.utc), utc=True)
-    current_monday = (current_date - pd.Timedelta(days=current_date.weekday())).normalize()
-    weeks = pd.date_range(min_week, current_monday, freq='W-MON', tz='UTC')
-    new_rows = []
-    for week in weeks:
-        for full_id in SUMMONERS:
-            summoner_name = full_id.split('#')[0]
-            config = CHAMPION_LISTS.get(full_id, {})
-            learning_req = config.get("learning_games_required", 2)
-            if not ((requirements['Week_Start'] == week.strftime('%Y-%m-%d')) &
-                    (requirements['SummonerName'] == summoner_name) &
-                    (requirements['Champion'] == 'Learning')).any():
-                new_rows.append([week.strftime('%Y-%m-%d'), summoner_name, 'Learning', learning_req])
-            total_req = config.get("total_games_required", 0)
-            if total_req > 0:
-                if not ((requirements['Week_Start'] == week.strftime('%Y-%m-%d')) &
-                        (requirements['SummonerName'] == summoner_name) &
-                        (requirements['Champion'] == 'Total Games')).any():
-                    new_rows.append([week.strftime('%Y-%m-%d'), summoner_name, 'Total Games', total_req])
-
-    if new_rows:
-        print(f"Appending {len(new_rows)} new requirement rows to Weekly_Requirements.")
-        batch_size = 20
-        for i in range(0, len(new_rows), batch_size):
-            batch = new_rows[i:i + batch_size]
-            for attempt in range(max_retries):
-                try:
-                    req_sheet.append_rows(batch)
-                    print(f"Successfully appended batch {i//batch_size + 1} of {len(new_rows)//batch_size + 1}")
-                    time.sleep(1)
+            try:
+                oldest_data = get_data(batch[-1], puuid)
+                if oldest_data:
+                    next_ts = int(pd.Timestamp(oldest_data["gamecreation"]).timestamp() * 1000) + 1
+                    print(f"[JUMP] Next batch after → {ms_to_central(next_ts):%Y-%m-%d %I:%M %p %Z}")
+                    if next_ts <= current:
+                        print("[STOP] No progress → finished")
+                        break
+                    current = next_ts
+                else:
+                    print("[STOP] Oldest match has no data → stopping")
                     break
-                except gspread.exceptions.APIError as e:
-                    if attempt < max_retries - 1:
-                        print(f"APIError on batch {i//batch_size + 1}: {e}. Retrying in {retry_delay} seconds...")
-                        time.sleep(retry_delay)
-                    else:
-                        print(f"Failed to append batch {i//batch_size + 1} after {max_retries} attempts: {e}")
-                        raise
-        requirements_data = req_sheet.get_all_values()
-        if requirements_data and requirements_data[0] == headers:
-            requirements = pd.DataFrame(req_sheet.get_all_records())
-            requirements = requirements.drop_duplicates(subset=['Week_Start', 'SummonerName', 'Champion'], keep='first')
-            print(f"Reloaded Weekly_Requirements with {len(requirements)} unique rows")
+            except:
+                break
+
+            time.sleep(0.25)
+            if len(all_ids) >= 2000:
+                print("[CAP] 2000 matches reached")
+                break
+
+        print(f"[FETCH] Total IDs collected: {len(all_ids)}")
+
+        # remove riot duplicate match IDs
+        unique_ids = []
+        seen = set()
+        for mid in all_ids:
+            if mid not in seen:
+                unique_ids.append(mid)
+                seen.add(mid)
+        all_ids = unique_ids
+        print(f"[DE-DUPE] Riot sent duplicates → reduced to {len(all_ids)} unique match IDs")
+
+        # Perfect DB check — only on real unique IDs
+        if all_ids:
+            existing = supabase.table("matches")\
+                .select("match_id")\
+                .eq("summonername", name.lower())\
+                .in_("match_id", all_ids)\
+                .execute()
+            existing_ids = {row["match_id"] for row in existing.data} if existing.data else set()
+            new_ids = [mid for mid in all_ids if mid not in existing_ids]
         else:
-            requirements = pd.DataFrame(new_rows, columns=headers)
+            new_ids = []
 
-    if not requirements.empty and 'Week_Start' in requirements.columns:
-        requirements['Week_Start'] = pd.to_datetime(requirements['Week_Start'], errors='coerce', utc=True)
-        requirements = requirements[requirements['Week_Start'] >= pd.to_datetime('2025-09-01', utc=True)]
-        requirements['Required_Games'] = requirements['Required_Games'].astype(int, errors='ignore')
-    else:
-        print("No valid requirements data after reload. Proceeding with empty requirements.")
-        requirements = pd.DataFrame(columns=headers)
+        print(f"[NEW] {len(new_ids)} truly new matches to insert")
 
-    learning_rows = []
-    for full_id in SUMMONERS:
-        summoner_name = full_id.split('#')[0]
-        config = CHAMPION_LISTS.get(full_id, {})
-        core_champs = config.get("core_champions", [])
-        learning_req = config.get("learning_games_required", 2)
-        for week in requirements[requirements['SummonerName'] == summoner_name]['Week_Start'].unique():
-            if pd.isna(week):
-                continue
-            champ_rows = games_played[
-                (games_played['Week_Start'] == week) &
-                (games_played['summonerName'] == summoner_name) &
-                (games_played['champion'].isin(core_champs))
-            ]
-            total_learning_games = champ_rows['Games_Played'].sum()
-            learning_rows.append({
-                'Week_Start': week,
-                'summonerName': summoner_name,
-                'champion': 'Learning',
-                'Games_Played': total_learning_games,
-                'Required_Games': learning_req,
-                'Difference': total_learning_games - learning_req,
-                'Met_Requirement': 'Yes' if total_learning_games >= learning_req else 'No'
+        for mid in new_ids:
+            try:
+                data = get_data(mid, puuid)
+                if not data:
+                    print(f"  [SKIP] {mid} → deleted or fake")
+                    continue
+
+                clean = {k: v for k, v in data.items() if v is not None}
+                clean["summonername"] = clean["summonername"].lower()
+                clean.pop("id", None)
+
+                supabase.table("matches").upsert(
+                    clean,
+                    on_conflict="match_id,summonername",
+                    ignore_duplicates=True
+                ).execute()
+
+                total_new += 1
+                print(f"  Inserted {mid} | {data.get('champion')} | {data.get('kills')}/{data.get('deaths')}/{data.get('assists')} | {'Win' if data.get('win') else 'Loss'}")
+
+            except Exception as e:
+                print(f"  [ERROR] {mid} → {e}")
+
+        # Save resume point
+        if all_ids:
+            latest = all_ids[0]
+            supabase.table("last_fetched_match").upsert(
+                {"summonerName": name, "lastMatchID": latest},
+                on_conflict="summonerName"
+            ).execute()
+            print(f"[RESUME POINT] {name} → {latest}")
+        else:
+            print(f"[RESUME POINT] No matches for {name}")
+
+    print(f"\nSUCCESS → {total_new} real matches inserted\n")
+
+
+# ----------------------------------------------------------------------
+# 2. weekly_requirements
+# ----------------------------------------------------------------------
+def write_current_week() -> None:
+    week = _ensure_current_week()
+    print(f"[REQUIREMENTS] Creating weekly_requirements for week {week}")
+
+    rows = []
+    for s in SUMMONERS:
+        player = s["summonerName"].lower()
+        key = f"{s['summonerName']}#{s['tagLine']}"
+        cfg = CHAMPION_LISTS.get(key)
+        if not cfg:
+            continue
+
+        for champ in cfg["core_champions"]:
+            rows.append({
+                "week_start": week,
+                "summonername": player,
+                "champion": champ,
+                "required_games": cfg["learning_games_required"],
+                "requirement_type": "Core Champion"
             })
 
-    total_rows = []
-    for full_id in SUMMONERS:
-        summoner_name = full_id.split('#')[0]
-        config = CHAMPION_LISTS.get(full_id, {})
-        total_req = config.get("total_games_required", 0)
-        champs_to_count = config.get("total_champions", [])
-        if total_req > 0 and champs_to_count:
-            for week in requirements[requirements['SummonerName'] == summoner_name]['Week_Start'].unique():
-                if pd.isna(week):
-                    continue
-                week_matches = matches[
-                    (matches['Week_Start'] == week) &
-                    (matches['summonerName'] == summoner_name) &
-                    (matches['champion'].isin(champs_to_count))
-                ]
-                total_games = len(week_matches)
-                total_rows.append({
-                    'Week_Start': week,
-                    'summonerName': summoner_name,
-                    'champion': 'Total Games',
-                    'Games_Played': total_games,
-                    'Required_Games': total_req,
-                    'Difference': total_games - total_req,
-                    'Met_Requirement': 'Yes' if total_games >= total_req else 'No'
+        for champ in cfg["total_champions"]:
+            if champ not in cfg["core_champions"]:
+                rows.append({
+                    "week_start": week,
+                    "summonername": player,
+                    "champion": champ,
+                    "required_games": cfg["total_games_required"],
+                    "requirement_type": "Practice Champion"
                 })
 
-    learning_df = pd.DataFrame(learning_rows).drop_duplicates(subset=['Week_Start', 'summonerName', 'champion'])
-    total_df = pd.DataFrame(total_rows).drop_duplicates(subset=['Week_Start', 'summonerName', 'champion'])
-    report = pd.concat([learning_df, total_df], ignore_index=True)
-    
-    if not report.empty:
-        report['Week_Start'] = pd.to_datetime(report['Week_Start'], utc=True)
-    else:
-        report = pd.DataFrame(columns=['Week_Start', 'summonerName', 'champion', 'Games_Played', 'Required_Games', 'Difference', 'Met_Requirement'])
+    if rows:
+        supabase.table("weekly_requirements").upsert(rows, on_conflict="week_start,summonername,champion").execute()
 
-    report = pd.merge(
-        requirements,
-        report,
-        how='left',
-        left_on=['Week_Start', 'SummonerName', 'Champion'],
-        right_on=['Week_Start', 'summonerName', 'champion'],
-        suffixes=('', '_report')
-    )
-    for col in ['Games_Played', 'Required_Games']:
-        if col not in report.columns:
-            report[col] = 0
-    report['summonerName'] = report['SummonerName']
-    report['champion'] = report['Champion']
-    report.drop(columns=['SummonerName', 'Champion'], inplace=True, errors='ignore')
-    report['Games_Played'] = report['Games_Played'].fillna(0).astype(int)
-    report['Required_Games'] = report['Required_Games'].fillna(0).astype(int)
-    report['Difference'] = report['Games_Played'] - report['Required_Games']
-    report['Met_Requirement'] = report.apply(lambda x: 'Yes' if x['Games_Played'] >= x['Required_Games'] else 'No', axis=1)
+    print(f"[REQUIREMENTS] Done — {len(rows)} rows\n")
 
-    report = report.drop_duplicates(subset=['Week_Start', 'summonerName', 'champion'], keep='first')
-    report = report.sort_values(['Met_Requirement', 'summonerName', 'Week_Start', 'champion'])
-    report['Week_Start'] = report['Week_Start'].dt.strftime('%Y-%m-%d')
 
-    try:
-        report_sheet = sheet.worksheet("Champion_Tracker")
-        sheet.del_worksheet(report_sheet)
-    except gspread.exceptions.WorksheetNotFound:
-        pass
-    report_sheet = sheet.add_worksheet(title="Champion_Tracker", rows=max(100, len(report)+1), cols=7)
-    headers = ["Week_Start", "summonerName", "champion", "Games_Played", "Required_Games", "Difference", "Met_Requirement"]
-    report_sheet.append_row(headers)
-    for attempt in range(max_retries):
-        try:
-            report_sheet.append_rows(report[headers].values.tolist())
-            print("Updated Champion tracking report generated in 'Champion_Tracker' sheet.")
-            break
-        except gspread.exceptions.APIError as e:
-            if attempt < max_retries - 1:
-                print(f"APIError writing to Champion_Tracker: {e}. Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-            else:
-                print(f"Failed to write to Champion_Tracker after {max_retries} attempts: {e}")
-                raise
+# ----------------------------------------------------------------------
+# 3. champion_tracker 
+# ----------------------------------------------------------------------
+def generate_champion_report() -> None:
+    print("[REPORT] Building champion_tracker — ALL real matches from START_TIMESTAMP")
+
+    raw = supabase.table("matches").select("summonername, champion, gamecreation").execute().data
+    if not raw:
+        print("[REPORT] No matches yet")
+        return
+
+    df = pd.DataFrame(raw)
+    df["gamecreation"] = pd.to_datetime(df["gamecreation"])
+
+    start_dt = datetime.fromtimestamp(START_TIMESTAMP / 1000, tz=timezone.utc)
+    df = df[df["gamecreation"] >= start_dt].copy()
+
+    if df.empty:
+        print("[REPORT] No matches after START_TIMESTAMP")
+        return
+
+    # Monday-start weeks — bulletproof
+    df["week_start"] = (df["gamecreation"] - pd.to_timedelta(df["gamecreation"].dt.weekday, unit='D')).dt.strftime('%Y-%m-%d')
+
+    weekly_counts = df.groupby(["week_start", "summonername", "champion"]).size().to_dict()
+    all_weeks = sorted(df["week_start"].unique())
+
+    print(f"[REPORT] Found {len(df)} real matches across {len(all_weeks)} weeks")
+
+    report = []
+    for week in all_weeks:
+        for s in SUMMONERS:
+            player = s["summonerName"].lower()
+            key = f"{s['summonerName']}#{s['tagLine']}"
+            cfg = CHAMPION_LISTS.get(key)
+            if not cfg:
+                continue
+
+            core_played = sum(weekly_counts.get((week, player, c), 0) for c in cfg["core_champions"])
+            pool_played = sum(weekly_counts.get((week, player, c), 0) for c in cfg["total_champions"])
+
+            report.extend([
+                {"week_start": week, "summonername": player, "champion_type": "Learning Games (Core)", "games_played": core_played, "required_games": cfg["learning_games_required"], "difference": core_played - cfg["learning_games_required"], "met_requirement": "Yes" if core_played >= cfg["learning_games_required"] else "No"},
+                {"week_start": week, "summonername": player, "champion_type": "Total Pool Games", "games_played": pool_played, "required_games": cfg["total_games_required"], "difference": pool_played - cfg["total_games_required"], "met_requirement": "Yes" if pool_played >= cfg["total_games_required"] else "No"},
+            ])
+
+    if report:
+        supabase.table("champion_tracker").upsert(report, on_conflict="week_start,summonername,champion_type").execute()
+        print(f"[REPORT] SUCCESS → {len(all_weeks)} weeks | {len(df)} matches | {len(report)//2} players updated")

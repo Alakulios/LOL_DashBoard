@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
 import pytz
-
+from datetime import date, timedelta
 from dotenv import load_dotenv
 
 # ----------------------------------------------------------------------
@@ -167,12 +167,21 @@ queue_types: Dict[int, str] = {
 # ----------------------------------------------------------------------
 # Week helper – Monday of current week (UTC-based)
 # ----------------------------------------------------------------------
-def get_monday(date) -> datetime.date:
-    return date - timedelta(days=date.weekday())
+# ----------------------------------------------------------------------
+# Week helper – Monday of the week we are ACTUALLY IN (Mon 00:00 → Sun 23:59)
+# This is the correct one — Sunday belongs to the week that just ended
+# ----------------------------------------------------------------------
 
-def get_current_monday() -> datetime.date:
-    return get_monday(datetime.now(timezone.utc).date())
 
+def get_current_monday() -> date:
+    """
+    Returns the Monday of the current playing week.
+    Sunday Nov 23 → 2025-11-17
+    Monday Nov 24 → 2025-11-24
+    """
+    today = datetime.now(timezone.utc).date()
+    monday = today - timedelta(days=today.weekday())  # weekday(): 0=Mon → 6=Sun
+    return monday
 # ----------------------------------------------------------------------
 # Final validation print
 # ----------------------------------------------------------------------

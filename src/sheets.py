@@ -1,14 +1,15 @@
 # src/sheets.py
 """
-FINAL VERSION —
-- Removes Riot's duplicate/fake match IDs 
+FINAL VERSION — Perfect week logic (Sunday belongs to current week)
+- Only advances on Monday 00:00 UTC
+- No more early zeros
 """
 
 from __future__ import annotations
 
 import pandas as pd
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Callable, Optional
 import pytz
 
@@ -29,29 +30,36 @@ from config import (
     SUPABASE_KEY,
     SUMMONERS,
     CHAMPION_LISTS,
-    get_current_monday,
     START_TIMESTAMP,
 )
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ----------------------------------------------------------------------
-# Current week helper
+# Current week helper — ONLY advances on Monday
 # ----------------------------------------------------------------------
 def _ensure_current_week() -> str:
-    today_monday = get_current_monday()
+    today = datetime.now(timezone.utc).date()
+    current_monday = today - timedelta(days=today.weekday())  # Mon=0, Sun=6 → Sunday stays in current week
+
     res = supabase.table("current_week").select("week_start").execute()
 
     if not res.data:
-        supabase.table("current_week").insert({"id": 1, "week_start": str(today_monday)}).execute()
-        print(f"[INIT] current_week → {today_monday}")
-        return str(today_monday)
+        supabase.table("current_week").insert({"id": 1, "week_start": str(current_monday)}).execute()
+        print(f"[INIT] current_week → {current_monday}")
+        return str(current_monday)
 
-    db_week = res.data[0]["week_start"]
-    if db_week != str(today_monday):
-        supabase.table("current_week").update({"week_start": str(today_monday)}).eq("id", 1).execute()
-        print(f"[ADVANCE] week {db_week} → {today_monday}")
-    return str(today_monday)
+    db_week_str = res.data[0]["week_start"]
+    db_week = datetime.strptime(db_week_str, "%Y-%m-%d").date()
+
+    if current_monday > db_week:
+        # Only advance when we actually enter a new week (Monday+)
+        supabase.table("current_week").update({"week_start": str(current_monday)}).eq("id", 1).execute()
+        print(f"[ADVANCE] week {db_week} → {current_monday}")
+        return str(current_monday)
+    else:
+        print(f"[CURRENT] Still in week {db_week} (today {today}, Sunday belongs here)")
+        return db_week_str
 
 
 # ----------------------------------------------------------------------
@@ -119,17 +127,12 @@ def update_match_data(
 
         print(f"[FETCH] Total IDs collected: {len(all_ids)}")
 
-        # remove riot duplicate match IDs
-        unique_ids = []
-        seen = set()
-        for mid in all_ids:
-            if mid not in seen:
-                unique_ids.append(mid)
-                seen.add(mid)
+        # Remove Riot duplicate match IDs
+        unique_ids = list(dict.fromkeys(all_ids))  # preserves order
         all_ids = unique_ids
         print(f"[DE-DUPE] Riot sent duplicates → reduced to {len(all_ids)} unique match IDs")
 
-        # Perfect DB check — only on real unique IDs
+        # DB duplicate check
         if all_ids:
             existing = supabase.table("matches")\
                 .select("match_id")\
@@ -174,8 +177,6 @@ def update_match_data(
                 on_conflict="summonerName"
             ).execute()
             print(f"[RESUME POINT] {name} → {latest}")
-        else:
-            print(f"[RESUME POINT] No matches for {name}")
 
     print(f"\nSUCCESS → {total_new} real matches inserted\n")
 
@@ -233,7 +234,6 @@ def generate_champion_report() -> None:
 
     df = pd.DataFrame(raw)
     df["gamecreation"] = pd.to_datetime(df["gamecreation"])
-
     start_dt = datetime.fromtimestamp(START_TIMESTAMP / 1000, tz=timezone.utc)
     df = df[df["gamecreation"] >= start_dt].copy()
 
@@ -241,9 +241,7 @@ def generate_champion_report() -> None:
         print("[REPORT] No matches after START_TIMESTAMP")
         return
 
-    # Monday-start weeks — bulletproof
     df["week_start"] = (df["gamecreation"] - pd.to_timedelta(df["gamecreation"].dt.weekday, unit='D')).dt.strftime('%Y-%m-%d')
-
     weekly_counts = df.groupby(["week_start", "summonername", "champion"]).size().to_dict()
     all_weeks = sorted(df["week_start"].unique())
 
@@ -269,3 +267,44 @@ def generate_champion_report() -> None:
     if report:
         supabase.table("champion_tracker").upsert(report, on_conflict="week_start,summonername,champion_type").execute()
         print(f"[REPORT] SUCCESS → {len(all_weeks)} weeks | {len(df)} matches | {len(report)//2} players updated")
+
+
+# ----------------------------------------------------------------------
+# 4. weekly_summary — clean "this week" view
+# ----------------------------------------------------------------------
+def generate_weekly_summary() -> None:
+    week = _ensure_current_week()
+    print(f"[SUMMARY] Generating weekly_summary for {week}")
+
+    tracker_data = supabase.table("champion_tracker")\
+        .select("summonername", "champion_type", "games_played", "required_games", "met_requirement")\
+        .eq("week_start", week)\
+        .execute().data
+
+    summary_rows = []
+    for s in SUMMONERS:
+        player = s["summonerName"].lower()
+        key = f"{s['summonerName']}#{s['tagLine']}"
+        cfg = CHAMPION_LISTS.get(key)
+        if not cfg:
+            continue
+
+        core_row = next((r for r in tracker_data if r["summonername"] == player and r["champion_type"] == "Learning Games (Core)"), None)
+        pool_row = next((r for r in tracker_data if r["summonername"] == player and r["champion_type"] == "Total Pool Games"), None)
+
+        summary_rows.append({
+            "week_start": week,
+            "summonername": player,
+            "core_games_played": core_row["games_played"] if core_row else 0,
+            "core_required": cfg["learning_games_required"],
+            "pool_games_played": pool_row["games_played"] if pool_row else 0,
+            "pool_required": cfg["total_games_required"],
+        })
+
+    if summary_rows:
+        supabase.table("weekly_summary")\
+            .upsert(summary_rows, on_conflict="week_start,summonername")\
+            .execute()
+        print(f"[SUMMARY] Updated {len(summary_rows)} players in weekly_summary")
+    else:
+        print("[SUMMARY] No players configured")

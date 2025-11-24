@@ -29,7 +29,7 @@ def nuke_pycache() -> None:
 if __name__ == "__main__":
     nuke_pycache()
     #
-    from sheets import update_match_data, write_current_week, generate_champion_report
+    from sheets import update_match_data, write_current_week, generate_champion_report, generate_weekly_summary 
     from riot_api import get_summoner_puuid, get_match_ids, get_match_data
 
     print("Starting LoL Dashboard update...\n")
@@ -42,5 +42,6 @@ if __name__ == "__main__":
 
     write_current_week()
     generate_champion_report()
+    generate_weekly_summary()
 
     print("\nLoL Dashboard update complete!")
